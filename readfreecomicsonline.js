@@ -136,9 +136,17 @@ async function extractChapters(url) {
                 seenUrls[item.url] = true;
                 addedAny = true;
 
+                // Specials/one-shots (e.g. "... Special Issue 1 ...",
+                // "... Noir Edition Issue 1 ...") are not part of the main
+                // numbering even though the regex below would otherwise
+                // match "Issue 1" inside them. Leave those unnumbered so
+                // they don't collide with the real Issue 1's badge.
                 let number = 0;
-                const numMatch = /Issue\s+(\d+(?:\.\d+)?)/i.exec(item.title);
-                if (numMatch) number = parseFloat(numMatch[1]);
+                const isSpecial = /\b(Special|Noir Edition|Annual)\b/i.test(item.title);
+                if (!isSpecial) {
+                    const numMatch = /Issue\s+(\d+(?:\.\d+)?)/i.exec(item.title);
+                    if (numMatch) number = parseFloat(numMatch[1]);
+                }
 
                 issues.push({
                     id: item.url,
@@ -151,12 +159,44 @@ async function extractChapters(url) {
             if (!addedAny) break;
         }
 
-        issues.sort(function (a, b) { return a.ts - b.ts; });
+        // Numbered issues sort by their own number, which is immune to any
+        // bad/missing publish-date metadata on the site (a single glitchy
+        // datetime was previously sorting an issue to the front of the
+        // list). Unnumbered specials get merged in by publish date relative
+        // to the numbered issues around them.
+        const numbered = issues.filter(function (x) { return x.chapter > 0; });
+        const specials = issues.filter(function (x) { return x.chapter <= 0; });
+        numbered.sort(function (a, b) { return a.chapter - b.chapter; });
+        specials.sort(function (a, b) { return a.ts - b.ts; });
+
+        const merged = [];
+        let si = 0;
+        for (let i = 0; i < numbered.length; i++) {
+            while (si < specials.length && specials[si].ts <= numbered[i].ts) {
+                merged.push(specials[si]);
+                si++;
+            }
+            merged.push(numbered[i]);
+        }
+        while (si < specials.length) {
+            merged.push(specials[si]);
+            si++;
+        }
 
         const results = [];
-        for (let i = 0; i < issues.length; i++) {
-            const issue = issues[i];
-            const chapterNum = issue.chapter > 0 ? issue.chapter : (i + 1);
+        let lastNumbered = 0;
+        let specialOffset = 0;
+        for (let i = 0; i < merged.length; i++) {
+            const issue = merged[i];
+            let chapterNum;
+            if (issue.chapter > 0) {
+                chapterNum = issue.chapter;
+                lastNumbered = issue.chapter;
+                specialOffset = 0;
+            } else {
+                specialOffset += 1;
+                chapterNum = lastNumbered + specialOffset * 0.1;
+            }
             results.push([String(chapterNum), [{
                 id: issue.id,
                 title: issue.title,
@@ -175,11 +215,21 @@ async function extractImages(url) {
         const response = await fetch(url);
         const html = await response.text();
 
+        // Scope to entry-content only. The featured-image block above it
+        // reuses page 1's art under a filename that differs only by an
+        // extra "-1" suffix, so a page-wide scan double-counts page 1.
+        const startIdx = html.indexOf('<div class="entry-content"');
+        const footerIdx = html.indexOf('<footer class="entry-meta"', startIdx === -1 ? 0 : startIdx);
+        let scoped = html;
+        if (startIdx !== -1) {
+            scoped = footerIdx !== -1 ? html.substring(startIdx, footerIdx) : html.substring(startIdx);
+        }
+
         const images = [];
         const seen = {};
         const imgRegex = /<img[^>]+src="([^"]+)"/g;
         let m;
-        while ((m = imgRegex.exec(html)) !== null) {
+        while ((m = imgRegex.exec(scoped)) !== null) {
             const src = m[1];
             if (src.indexOf("/wp-content/uploads/") === -1) continue;
             if (!/\.(webp|jpe?g|png)(\?.*)?$/i.test(src)) continue;
