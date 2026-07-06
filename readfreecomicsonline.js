@@ -138,20 +138,22 @@ async function extractChapters(url) {
 
                 // Specials/one-shots (e.g. "... Special Issue 1 ...",
                 // "... Noir Edition Issue 1 ...") are not part of the main
-                // numbering even though the regex below would otherwise
-                // match "Issue 1" inside them. Leave those unnumbered so
-                // they don't collide with the real Issue 1's badge.
-                let number = 0;
-                const isSpecial = /\b(Special|Noir Edition|Annual)\b/i.test(item.title);
-                if (!isSpecial) {
-                    const numMatch = /Issue\s+(\d+(?:\.\d+)?)/i.exec(item.title);
-                    if (numMatch) number = parseFloat(numMatch[1]);
-                }
+                // numbering, but the number in their own title usually
+                // names which issue they're a companion to. Anchor them
+                // there instead of placing them by their own publish date
+                // on the site, which reflects upload timing, not reading
+                // order (a Noir re-release of Issue 1 uploaded after
+                // Issue 3 went live would otherwise land after Issue 3).
+                const isSpecial = /\b(Special|Noir Edition|Annual|Variant)\b/i.test(item.title);
+                let refNumber = 0;
+                const numMatch = /Issue\s+(\d+(?:\.\d+)?)/i.exec(item.title);
+                if (numMatch) refNumber = parseFloat(numMatch[1]);
 
                 issues.push({
                     id: item.url,
                     title: item.title,
-                    chapter: number,
+                    isSpecial: isSpecial,
+                    refNumber: refNumber,
                     ts: item.ts
                 });
             }
@@ -159,29 +161,47 @@ async function extractChapters(url) {
             if (!addedAny) break;
         }
 
-        // Numbered issues sort by their own number, which is immune to any
-        // bad/missing publish-date metadata on the site (a single glitchy
-        // datetime was previously sorting an issue to the front of the
-        // list). Unnumbered specials get merged in by publish date relative
-        // to the numbered issues around them.
-        const numbered = issues.filter(function (x) { return x.chapter > 0; });
-        const specials = issues.filter(function (x) { return x.chapter <= 0; });
-        numbered.sort(function (a, b) { return a.chapter - b.chapter; });
-        specials.sort(function (a, b) { return a.ts - b.ts; });
+        const numbered = issues.filter(function (x) { return !x.isSpecial && x.refNumber > 0; });
+        const specials = issues.filter(function (x) { return x.isSpecial; });
+        const unnumbered = issues.filter(function (x) { return !x.isSpecial && x.refNumber <= 0; });
+
+        numbered.sort(function (a, b) { return a.refNumber - b.refNumber; });
+        specials.sort(function (a, b) {
+            if (a.refNumber !== b.refNumber) return a.refNumber - b.refNumber;
+            return a.ts - b.ts;
+        });
+        unnumbered.sort(function (a, b) { return a.ts - b.ts; });
+
+        const byAnchor = {};
+        const orphanSpecials = [];
+        for (let i = 0; i < specials.length; i++) {
+            const s = specials[i];
+            if (s.refNumber > 0) {
+                if (!byAnchor[s.refNumber]) byAnchor[s.refNumber] = [];
+                byAnchor[s.refNumber].push(s);
+            } else {
+                orphanSpecials.push(s);
+            }
+        }
 
         const merged = [];
-        let si = 0;
+        const usedAnchors = {};
         for (let i = 0; i < numbered.length; i++) {
-            while (si < specials.length && specials[si].ts <= numbered[i].ts) {
-                merged.push(specials[si]);
-                si++;
-            }
             merged.push(numbered[i]);
+            const key = numbered[i].refNumber;
+            const group = byAnchor[key];
+            if (group) {
+                merged.push.apply(merged, group);
+                usedAnchors[key] = true;
+            }
         }
-        while (si < specials.length) {
-            merged.push(specials[si]);
-            si++;
+        // Specials referencing an issue number that wasn't found among the
+        // numbered issues (or no number at all) get appended at the end.
+        for (const key in byAnchor) {
+            if (!usedAnchors[key]) merged.push.apply(merged, byAnchor[key]);
         }
+        merged.push.apply(merged, orphanSpecials);
+        merged.push.apply(merged, unnumbered);
 
         const results = [];
         let lastNumbered = 0;
@@ -189,13 +209,14 @@ async function extractChapters(url) {
         for (let i = 0; i < merged.length; i++) {
             const issue = merged[i];
             let chapterNum;
-            if (issue.chapter > 0) {
-                chapterNum = issue.chapter;
-                lastNumbered = issue.chapter;
+            if (!issue.isSpecial && issue.refNumber > 0) {
+                chapterNum = issue.refNumber;
+                lastNumbered = issue.refNumber;
                 specialOffset = 0;
             } else {
                 specialOffset += 1;
-                chapterNum = lastNumbered + specialOffset * 0.1;
+                const anchor = issue.refNumber > 0 ? issue.refNumber : lastNumbered;
+                chapterNum = anchor + specialOffset * 0.1;
             }
             results.push([String(chapterNum), [{
                 id: issue.id,
